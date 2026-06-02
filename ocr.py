@@ -12,20 +12,17 @@ class OCRApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Advanced EasyOCR Numeric Scanner")
-        self.setGeometry(100, 100, 1000, 700)
+        self.setGeometry(100, 100, 1000, 750)
 
-        # Initialize EasyOCR (loads model into memory)
         print("Loading EasyOCR Model...")
         self.reader = easyocr.Reader(['en'])
         
-        # State Variables
         self.capture = None
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.current_frame = None
         self.roi = None  # (x, y, w, h)
         
-        # Look-alike mapping dictionary
         self.look_alikes = {
             'O':'0', 'o':'0', 'l':'1', 'I':'1', 'i':'1', 
             'S':'5', 's':'5', 'Z':'2', 'z':'2', 'B':'8', 
@@ -51,7 +48,7 @@ class OCRApp(QMainWindow):
         # Preprocessing Controls
         control_layout = QHBoxLayout()
         
-        self.otsu_checkbox = QCheckBox("Use Auto Otsu Threshold")
+        self.otsu_checkbox = QCheckBox("Auto Otsu Threshold")
         self.otsu_checkbox.setChecked(False)
         self.otsu_checkbox.stateChanged.connect(self.toggle_otsu)
         control_layout.addWidget(self.otsu_checkbox)
@@ -92,8 +89,20 @@ class OCRApp(QMainWindow):
         self.btn_clear_roi.clicked.connect(self.clear_roi)
         right_layout.addWidget(self.btn_clear_roi)
 
-        self.btn_run_ocr = QPushButton("5. RUN OCR (Numerics Only)")
-        self.btn_run_ocr.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        # --- NEW: Confidence Slider ---
+        right_layout.addWidget(QLabel("--- OCR Settings ---"))
+        self.conf_label = QLabel("Min Confidence: 50%")
+        right_layout.addWidget(self.conf_label)
+        
+        self.conf_slider = QSlider(Qt.Horizontal)
+        self.conf_slider.setMinimum(0)
+        self.conf_slider.setMaximum(100)
+        self.conf_slider.setValue(50)
+        self.conf_slider.valueChanged.connect(self.update_conf_label)
+        right_layout.addWidget(self.conf_slider)
+
+        self.btn_run_ocr = QPushButton("5. RUN OCR")
+        self.btn_run_ocr.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; margin-top: 10px;")
         self.btn_run_ocr.clicked.connect(self.run_ocr)
         right_layout.addWidget(self.btn_run_ocr)
         
@@ -109,12 +118,15 @@ class OCRApp(QMainWindow):
     def update_slider_label(self):
         self.thresh_label.setText(f"Manual Threshold: {self.thresh_slider.value()}")
         if not self.timer.isActive() and self.current_frame is not None:
-            self.display_frame(self.current_frame) # Update static image immediately
+            self.display_frame(self.current_frame)
+
+    def update_conf_label(self):
+        self.conf_label.setText(f"Min Confidence: {self.conf_slider.value()}%")
 
     def toggle_otsu(self):
         self.thresh_slider.setEnabled(not self.otsu_checkbox.isChecked())
         if not self.timer.isActive() and self.current_frame is not None:
-            self.display_frame(self.current_frame) # Update static image immediately
+            self.display_frame(self.current_frame)
 
     def clear_roi(self):
         self.roi = None
@@ -136,11 +148,11 @@ class OCRApp(QMainWindow):
         if fname:
             self.capture = cv2.VideoCapture(fname)
             self.roi = None
-            self.timer.start(30) # ~30 fps
+            self.timer.start(30)
 
     def start_camera(self):
         self.stop_media()
-        self.capture = cv2.VideoCapture(0) # 0 is default webcam
+        self.capture = cv2.VideoCapture(0)
         self.roi = None
         self.timer.start(30)
 
@@ -150,7 +162,7 @@ class OCRApp(QMainWindow):
             self.capture.release()
             self.capture = None
 
-    # --- Video & Image Processing ---
+    # --- Video Processing ---
     def update_frame(self):
         if self.capture:
             ret, frame = self.capture.read()
@@ -158,35 +170,25 @@ class OCRApp(QMainWindow):
                 self.current_frame = frame
                 self.display_frame(frame)
             else:
-                self.stop_media() # End of video
+                self.stop_media()
 
     def apply_preprocessing(self, frame):
-        """Applies Grayscale and Thresholding based on UI controls"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
         if self.otsu_checkbox.isChecked():
-            # Apply Otsu's Threshold
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         else:
-            # Apply Manual Threshold
             val = self.thresh_slider.value()
             _, thresh = cv2.threshold(gray, val, 255, cv2.THRESH_BINARY)
-            
         return thresh
 
     def display_frame(self, frame):
-        # 1. Apply preprocessing to see what the OCR will see
         processed = self.apply_preprocessing(frame)
-        
-        # 2. Convert back to BGR for drawing colored ROI boxes
         display_img = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
         
-        # 3. Draw ROI if it exists
         if self.roi:
             x, y, w, h = self.roi
             cv2.rectangle(display_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
             
-        # 4. Convert to PyQt format
         h, w, ch = display_img.shape
         bytes_per_line = ch * w
         q_img = QImage(display_img.data, w, h, bytes_per_line, QImage.Format_RGB888).rgbSwapped()
@@ -201,15 +203,36 @@ class OCRApp(QMainWindow):
             
         was_playing = self.timer.isActive()
         if was_playing:
-            self.timer.stop() # Pause feed while selecting
+            self.timer.stop()
 
-        # Use OpenCV's native ROI selector (pops up a temporary window)
-        QMessageBox.information(self, "Instructions", "A window will open. Draw a rectangle and press ENTER or SPACE to confirm.")
-        roi = cv2.selectROI("Select ROI (Press ENTER to confirm)", self.current_frame, showCrosshair=True, fromCenter=False)
-        cv2.destroyWindow("Select ROI (Press ENTER to confirm)")
+        # --- NEW: Smart ROI Scaling Logic ---
+        # Calculate a safe viewing size (max 800px high or 1200px wide)
+        h, w = self.current_frame.shape[:2]
+        max_height = 800
+        max_width = 1200
+        scale = 1.0
         
-        if roi[2] > 0 and roi[3] > 0: # Ensure valid width/height
-            self.roi = roi
+        if h > max_height or w > max_width:
+            scale = min(max_width / w, max_height / h)
+            display_frame = cv2.resize(self.current_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        else:
+            display_frame = self.current_frame.copy()
+
+        QMessageBox.information(self, "Instructions", "Draw a rectangle and press ENTER or SPACE to confirm.")
+        
+        roi_window_name = "Select ROI (Press ENTER to confirm)"
+        cv2.namedWindow(roi_window_name, cv2.WINDOW_NORMAL)
+        roi = cv2.selectROI(roi_window_name, display_frame, showCrosshair=True, fromCenter=False)
+        cv2.destroyWindow(roi_window_name)
+        
+        # If a valid box was drawn, map coordinates back to original high-res size
+        if roi[2] > 0 and roi[3] > 0: 
+            self.roi = (
+                int(roi[0] / scale), 
+                int(roi[1] / scale), 
+                int(roi[2] / scale), 
+                int(roi[3] / scale)
+            )
             
         if was_playing:
             self.timer.start(30)
@@ -218,7 +241,6 @@ class OCRApp(QMainWindow):
 
     # --- OCR Execution ---
     def clean_numeric_text(self, raw_text):
-        """Replaces look-alikes with numbers and strips standard alphabets"""
         cleaned = ""
         for char in raw_text:
             if char in self.look_alikes:
@@ -231,31 +253,39 @@ class OCRApp(QMainWindow):
         if self.current_frame is None:
             return
 
-        # 1. Get the image area to process
         if self.roi:
             x, y, w, h = self.roi
             target_img = self.current_frame[y:y+h, x:x+w]
         else:
             target_img = self.current_frame
             
-        # 2. Apply the exact same preprocessing we show on screen
         processed_img = self.apply_preprocessing(target_img)
         
         self.result_text.append("Scanning...")
-        QApplication.processEvents() # Force UI update
+        QApplication.processEvents()
 
-        # 3. Run EasyOCR 
-        # We pass an allowlist that includes digits AND our look-alikes to prevent it from guessing random symbols
         allowed_chars = '0123456789' + ''.join(self.look_alikes.keys())
         results = self.reader.readtext(processed_img, allowlist=allowed_chars)
         
-        # 4. Parse and clean results
+        # --- NEW: Filter by Confidence Threshold ---
+        min_conf = self.conf_slider.value() / 100.0 # Convert 0-100 to 0.0-1.0
+        
         self.result_text.append("--- OCR Results ---")
+        found_any = False
+        
         for (bbox, text, prob) in results:
-            final_text = self.clean_numeric_text(text)
-            if final_text: # Only print if there's an actual number left
-                self.result_text.append(f"Found: {final_text} (Confidence: {prob:.2f})")
+            if prob >= min_conf:
+                final_text = self.clean_numeric_text(text)
+                if final_text: 
+                    self.result_text.append(f"Found: {final_text} (Confidence: {prob:.2f})")
+                    found_any = True
+                    
+        if not found_any:
+            self.result_text.append(f"No numerics found above {int(min_conf*100)}% confidence.")
+            
         self.result_text.append("-" * 20)
+        # Scroll to bottom
+        self.result_text.verticalScrollBar().setValue(self.result_text.verticalScrollBar().maximum())
 
     def closeEvent(self, event):
         self.stop_media()
