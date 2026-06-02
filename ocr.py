@@ -12,7 +12,7 @@ class OCRApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Advanced EasyOCR Numeric Scanner")
-        self.setGeometry(100, 100, 1000, 750)
+        self.setGeometry(100, 100, 1100, 750)
 
         print("Loading EasyOCR Model...")
         self.reader = easyocr.Reader(['en'])
@@ -21,7 +21,7 @@ class OCRApp(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.current_frame = None
-        self.roi = None  # (x, y, w, h)
+        self.roi = None  
         
         self.look_alikes = {
             'O':'0', 'o':'0', 'l':'1', 'I':'1', 'i':'1', 
@@ -48,20 +48,33 @@ class OCRApp(QMainWindow):
         # Preprocessing Controls
         control_layout = QHBoxLayout()
         
-        self.otsu_checkbox = QCheckBox("Auto Otsu Threshold")
+        # 1. Otsu Checkbox
+        self.otsu_checkbox = QCheckBox("Auto Otsu")
         self.otsu_checkbox.setChecked(False)
-        self.otsu_checkbox.stateChanged.connect(self.toggle_otsu)
+        self.otsu_checkbox.stateChanged.connect(self.update_ui_state)
         control_layout.addWidget(self.otsu_checkbox)
         
-        self.thresh_label = QLabel("Manual Threshold: 127")
+        # 2. Threshold Slider
+        self.thresh_label = QLabel("Thresh: 127")
         control_layout.addWidget(self.thresh_label)
         
         self.thresh_slider = QSlider(Qt.Horizontal)
         self.thresh_slider.setMinimum(0)
         self.thresh_slider.setMaximum(255)
         self.thresh_slider.setValue(127)
-        self.thresh_slider.valueChanged.connect(self.update_slider_label)
+        self.thresh_slider.valueChanged.connect(self.update_ui_state)
         control_layout.addWidget(self.thresh_slider)
+
+        # 3. NEW: Dilation Slider (To connect 7-segment gaps)
+        self.dilate_label = QLabel("Dilation (Thickness): 0")
+        control_layout.addWidget(self.dilate_label)
+        
+        self.dilate_slider = QSlider(Qt.Horizontal)
+        self.dilate_slider.setMinimum(0)
+        self.dilate_slider.setMaximum(10) # 10 is usually more than enough
+        self.dilate_slider.setValue(0)
+        self.dilate_slider.valueChanged.connect(self.update_ui_state)
+        control_layout.addWidget(self.dilate_slider)
         
         left_layout.addLayout(control_layout)
         main_layout.addLayout(left_layout, stretch=2)
@@ -89,16 +102,15 @@ class OCRApp(QMainWindow):
         self.btn_clear_roi.clicked.connect(self.clear_roi)
         right_layout.addWidget(self.btn_clear_roi)
 
-        # --- NEW: Confidence Slider ---
         right_layout.addWidget(QLabel("--- OCR Settings ---"))
-        self.conf_label = QLabel("Min Confidence: 50%")
+        self.conf_label = QLabel("Min Confidence: 15%")
         right_layout.addWidget(self.conf_label)
         
         self.conf_slider = QSlider(Qt.Horizontal)
         self.conf_slider.setMinimum(0)
         self.conf_slider.setMaximum(100)
-        self.conf_slider.setValue(50)
-        self.conf_slider.valueChanged.connect(self.update_conf_label)
+        self.conf_slider.setValue(15)
+        self.conf_slider.valueChanged.connect(self.update_ui_state)
         right_layout.addWidget(self.conf_slider)
 
         self.btn_run_ocr = QPushButton("5. RUN OCR")
@@ -115,16 +127,13 @@ class OCRApp(QMainWindow):
         main_widget.setLayout(main_layout)
 
     # --- UI Logic ---
-    def update_slider_label(self):
-        self.thresh_label.setText(f"Manual Threshold: {self.thresh_slider.value()}")
-        if not self.timer.isActive() and self.current_frame is not None:
-            self.display_frame(self.current_frame)
-
-    def update_conf_label(self):
-        self.conf_label.setText(f"Min Confidence: {self.conf_slider.value()}%")
-
-    def toggle_otsu(self):
+    def update_ui_state(self):
+        """Consolidated UI updater for all sliders and checkboxes"""
         self.thresh_slider.setEnabled(not self.otsu_checkbox.isChecked())
+        self.thresh_label.setText(f"Thresh: {self.thresh_slider.value()}")
+        self.dilate_label.setText(f"Dilation: {self.dilate_slider.value()}")
+        self.conf_label.setText(f"Min Confidence: {self.conf_slider.value()}%")
+        
         if not self.timer.isActive() and self.current_frame is not None:
             self.display_frame(self.current_frame)
 
@@ -173,12 +182,24 @@ class OCRApp(QMainWindow):
                 self.stop_media()
 
     def apply_preprocessing(self, frame):
+        # 1. Grayscale
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
+        
+        # 2. Thresholding
         if self.otsu_checkbox.isChecked():
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         else:
             val = self.thresh_slider.value()
             _, thresh = cv2.threshold(gray, val, 255, cv2.THRESH_BINARY)
+            
+        # 3. NEW: Dilation (Morphological operations to connect broken segments)
+        dilate_val = self.dilate_slider.value()
+        if dilate_val > 0:
+            # Create a matrix (kernel) based on the slider size
+            kernel = np.ones((dilate_val, dilate_val), np.uint8)
+            # Expand the white areas using the kernel
+            thresh = cv2.dilate(thresh, kernel, iterations=1)
+            
         return thresh
 
     def display_frame(self, frame):
@@ -205,8 +226,6 @@ class OCRApp(QMainWindow):
         if was_playing:
             self.timer.stop()
 
-        # --- NEW: Smart ROI Scaling Logic ---
-        # Calculate a safe viewing size (max 800px high or 1200px wide)
         h, w = self.current_frame.shape[:2]
         max_height = 800
         max_width = 1200
@@ -225,7 +244,6 @@ class OCRApp(QMainWindow):
         roi = cv2.selectROI(roi_window_name, display_frame, showCrosshair=True, fromCenter=False)
         cv2.destroyWindow(roi_window_name)
         
-        # If a valid box was drawn, map coordinates back to original high-res size
         if roi[2] > 0 and roi[3] > 0: 
             self.roi = (
                 int(roi[0] / scale), 
@@ -245,7 +263,7 @@ class OCRApp(QMainWindow):
         for char in raw_text:
             if char in self.look_alikes:
                 cleaned += self.look_alikes[char]
-            elif char.isdigit():
+            elif char.isdigit() or char == '.': # Added '.' to allow decimals for weights
                 cleaned += char
         return cleaned
 
@@ -264,11 +282,11 @@ class OCRApp(QMainWindow):
         self.result_text.append("Scanning...")
         QApplication.processEvents()
 
-        allowed_chars = '0123456789' + ''.join(self.look_alikes.keys())
+        # Added decimal to allowed characters
+        allowed_chars = '0123456789.' + ''.join(self.look_alikes.keys())
         results = self.reader.readtext(processed_img, allowlist=allowed_chars)
         
-        # --- NEW: Filter by Confidence Threshold ---
-        min_conf = self.conf_slider.value() / 100.0 # Convert 0-100 to 0.0-1.0
+        min_conf = self.conf_slider.value() / 100.0 
         
         self.result_text.append("--- OCR Results ---")
         found_any = False
@@ -284,7 +302,6 @@ class OCRApp(QMainWindow):
             self.result_text.append(f"No numerics found above {int(min_conf*100)}% confidence.")
             
         self.result_text.append("-" * 20)
-        # Scroll to bottom
         self.result_text.verticalScrollBar().setValue(self.result_text.verticalScrollBar().maximum())
 
     def closeEvent(self, event):
