@@ -2,11 +2,49 @@ import sys
 import cv2
 import numpy as np
 import easyocr
+import time
+from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QSlider, QCheckBox, QTextEdit, QMessageBox)
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
+
+# ==========================================
+# NEW: Background Thread for Continuous OCR
+# ==========================================
+class OCRWorker(QThread):
+    result_ready = pyqtSignal(list)
+
+    def __init__(self, reader, allowed_chars):
+        super().__init__()
+        self.reader = reader
+        self.allowed_chars = allowed_chars
+        self.is_running = False
+        self.current_target = None
+
+    def run(self):
+        self.is_running = True
+        while self.is_running:
+            if self.current_target is not None:
+                # 1. Grab a copy of the current target frame
+                frame_to_process = self.current_target.copy()
+                
+                # 2. Run OCR
+                results = self.reader.readtext(frame_to_process, allowlist=self.allowed_chars)
+                
+                # 3. Send results back to main thread
+                self.result_ready.emit(results)
+                
+            # Scan once per second to prevent CPU overload and UI freezing
+            time.sleep(1.0) 
+
+    def update_target(self, img):
+        self.current_target = img
+
+    def stop(self):
+        self.is_running = False
+# ==========================================
 
 class OCRApp(QMainWindow):
     def __init__(self):
@@ -29,6 +67,11 @@ class OCRApp(QMainWindow):
             'b':'8', 'G':'6', 'g':'9', 'q':'9', 'A':'4'
         }
         
+        # Initialize background worker
+        allowed_chars = '0123456789.' + ''.join(self.look_alikes.keys())
+        self.ocr_worker = OCRWorker(self.reader, allowed_chars)
+        self.ocr_worker.result_ready.connect(self.handle_auto_results)
+        
         self.initUI()
 
     def initUI(self):
@@ -48,13 +91,11 @@ class OCRApp(QMainWindow):
         # Preprocessing Controls
         control_layout = QHBoxLayout()
         
-        # 1. Otsu Checkbox
         self.otsu_checkbox = QCheckBox("Auto Otsu")
         self.otsu_checkbox.setChecked(False)
         self.otsu_checkbox.stateChanged.connect(self.update_ui_state)
         control_layout.addWidget(self.otsu_checkbox)
         
-        # 2. Threshold Slider
         self.thresh_label = QLabel("Thresh: 127")
         control_layout.addWidget(self.thresh_label)
         
@@ -65,13 +106,12 @@ class OCRApp(QMainWindow):
         self.thresh_slider.valueChanged.connect(self.update_ui_state)
         control_layout.addWidget(self.thresh_slider)
 
-        # 3. NEW: Dilation Slider (To connect 7-segment gaps)
-        self.dilate_label = QLabel("Dilation (Thickness): 0")
+        self.dilate_label = QLabel("Dilation: 0")
         control_layout.addWidget(self.dilate_label)
         
         self.dilate_slider = QSlider(Qt.Horizontal)
         self.dilate_slider.setMinimum(0)
-        self.dilate_slider.setMaximum(10) # 10 is usually more than enough
+        self.dilate_slider.setMaximum(10) 
         self.dilate_slider.setValue(0)
         self.dilate_slider.valueChanged.connect(self.update_ui_state)
         control_layout.addWidget(self.dilate_slider)
@@ -113,10 +153,26 @@ class OCRApp(QMainWindow):
         self.conf_slider.valueChanged.connect(self.update_ui_state)
         right_layout.addWidget(self.conf_slider)
 
-        self.btn_run_ocr = QPushButton("5. RUN OCR")
-        self.btn_run_ocr.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; margin-top: 10px;")
+        # --- NEW: Action Buttons ---
+        action_layout = QHBoxLayout()
+        
+        self.btn_run_ocr = QPushButton("RUN OCR\n(Single)")
+        self.btn_run_ocr.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self.btn_run_ocr.clicked.connect(self.run_ocr)
-        right_layout.addWidget(self.btn_run_ocr)
+        action_layout.addWidget(self.btn_run_ocr)
+        
+        self.btn_auto_update = QPushButton("Auto-Capture\n(Update)")
+        self.btn_auto_update.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        self.btn_auto_update.clicked.connect(self.start_auto_ocr)
+        action_layout.addWidget(self.btn_auto_update)
+
+        self.btn_stop_auto = QPushButton("Stop\nAuto")
+        self.btn_stop_auto.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;")
+        self.btn_stop_auto.setEnabled(False)
+        self.btn_stop_auto.clicked.connect(self.stop_auto_ocr)
+        action_layout.addWidget(self.btn_stop_auto)
+
+        right_layout.addLayout(action_layout)
         
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
@@ -128,7 +184,6 @@ class OCRApp(QMainWindow):
 
     # --- UI Logic ---
     def update_ui_state(self):
-        """Consolidated UI updater for all sliders and checkboxes"""
         self.thresh_slider.setEnabled(not self.otsu_checkbox.isChecked())
         self.thresh_label.setText(f"Thresh: {self.thresh_slider.value()}")
         self.dilate_label.setText(f"Dilation: {self.dilate_slider.value()}")
@@ -167,6 +222,7 @@ class OCRApp(QMainWindow):
 
     def stop_media(self):
         self.timer.stop()
+        self.stop_auto_ocr()
         if self.capture:
             self.capture.release()
             self.capture = None
@@ -178,26 +234,30 @@ class OCRApp(QMainWindow):
             if ret:
                 self.current_frame = frame
                 self.display_frame(frame)
+                
+                # If Auto-Capture is active, feed the latest frame to the worker thread
+                if self.ocr_worker.is_running:
+                    if self.roi:
+                        x, y, w, h = self.roi
+                        target_img = frame[y:y+h, x:x+w]
+                    else:
+                        target_img = frame
+                    processed_img = self.apply_preprocessing(target_img)
+                    self.ocr_worker.update_target(processed_img)
             else:
                 self.stop_media()
 
     def apply_preprocessing(self, frame):
-        # 1. Grayscale
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
-        
-        # 2. Thresholding
         if self.otsu_checkbox.isChecked():
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         else:
             val = self.thresh_slider.value()
             _, thresh = cv2.threshold(gray, val, 255, cv2.THRESH_BINARY)
             
-        # 3. NEW: Dilation (Morphological operations to connect broken segments)
         dilate_val = self.dilate_slider.value()
         if dilate_val > 0:
-            # Create a matrix (kernel) based on the slider size
             kernel = np.ones((dilate_val, dilate_val), np.uint8)
-            # Expand the white areas using the kernel
             thresh = cv2.dilate(thresh, kernel, iterations=1)
             
         return thresh
@@ -257,16 +317,58 @@ class OCRApp(QMainWindow):
         else:
             self.display_frame(self.current_frame)
 
-    # --- OCR Execution ---
+    # --- Text Cleaning ---
     def clean_numeric_text(self, raw_text):
         cleaned = ""
         for char in raw_text:
             if char in self.look_alikes:
                 cleaned += self.look_alikes[char]
-            elif char.isdigit() or char == '.': # Added '.' to allow decimals for weights
+            elif char.isdigit() or char == '.': 
                 cleaned += char
         return cleaned
 
+    # --- AUTO OCR LOGIC (Continuous) ---
+    def start_auto_ocr(self):
+        if self.current_frame is None:
+            QMessageBox.warning(self, "Error", "Start a camera or video feed first.")
+            return
+        
+        self.btn_auto_update.setEnabled(False)
+        self.btn_run_ocr.setEnabled(False)
+        self.btn_stop_auto.setEnabled(True)
+        self.result_text.append("--- Auto-Capture Started ---")
+        self.ocr_worker.start()
+
+    def stop_auto_ocr(self):
+        if self.ocr_worker.is_running:
+            self.ocr_worker.stop()
+            self.ocr_worker.wait() # Safely wait for thread to close
+            self.btn_auto_update.setEnabled(True)
+            self.btn_run_ocr.setEnabled(True)
+            self.btn_stop_auto.setEnabled(False)
+            self.result_text.append("--- Auto-Capture Stopped ---")
+
+    def handle_auto_results(self, results):
+        """Receives data from the background thread without freezing the UI"""
+        min_conf = self.conf_slider.value() / 100.0 
+        found_any = False
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        output_lines = []
+        for (bbox, text, prob) in results:
+            if prob >= min_conf:
+                final_text = self.clean_numeric_text(text)
+                if final_text: 
+                    output_lines.append(f"[{timestamp}] Auto-Scan: {final_text} (Conf: {prob:.2f})")
+                    found_any = True
+                    
+        # Only print if we actually found something to avoid text spam
+        if found_any:
+            for line in output_lines:
+                self.result_text.append(line)
+            self.result_text.verticalScrollBar().setValue(self.result_text.verticalScrollBar().maximum())
+
+    # --- MANUAL OCR LOGIC (Single) ---
     def run_ocr(self):
         if self.current_frame is None:
             return
@@ -282,20 +384,20 @@ class OCRApp(QMainWindow):
         self.result_text.append("Scanning...")
         QApplication.processEvents()
 
-        # Added decimal to allowed characters
         allowed_chars = '0123456789.' + ''.join(self.look_alikes.keys())
         results = self.reader.readtext(processed_img, allowlist=allowed_chars)
         
         min_conf = self.conf_slider.value() / 100.0 
+        timestamp = datetime.now().strftime("%H:%M:%S")
         
-        self.result_text.append("--- OCR Results ---")
+        self.result_text.append(f"--- Manual Results [{timestamp}] ---")
         found_any = False
         
         for (bbox, text, prob) in results:
             if prob >= min_conf:
                 final_text = self.clean_numeric_text(text)
                 if final_text: 
-                    self.result_text.append(f"Found: {final_text} (Confidence: {prob:.2f})")
+                    self.result_text.append(f"[{timestamp}] Found: {final_text} (Conf: {prob:.2f})")
                     found_any = True
                     
         if not found_any:
@@ -313,3 +415,4 @@ if __name__ == '__main__':
     window = OCRApp()
     window.show()
     sys.exit(app.exec_())
+    
