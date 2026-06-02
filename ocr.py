@@ -6,12 +6,12 @@ import time
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QSlider, QCheckBox, QTextEdit, QMessageBox)
+                             QSlider, QCheckBox, QTextEdit, QMessageBox, QComboBox)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 
 # ==========================================
-# NEW: Background Thread for Continuous OCR
+# Background Thread for Continuous OCR
 # ==========================================
 class OCRWorker(QThread):
     result_ready = pyqtSignal(list)
@@ -27,16 +27,10 @@ class OCRWorker(QThread):
         self.is_running = True
         while self.is_running:
             if self.current_target is not None:
-                # 1. Grab a copy of the current target frame
                 frame_to_process = self.current_target.copy()
-                
-                # 2. Run OCR
                 results = self.reader.readtext(frame_to_process, allowlist=self.allowed_chars)
-                
-                # 3. Send results back to main thread
                 self.result_ready.emit(results)
                 
-            # Scan once per second to prevent CPU overload and UI freezing
             time.sleep(1.0) 
 
     def update_target(self, img):
@@ -67,7 +61,6 @@ class OCRApp(QMainWindow):
             'b':'8', 'G':'6', 'g':'9', 'q':'9', 'A':'4'
         }
         
-        # Initialize background worker
         allowed_chars = '0123456789.' + ''.join(self.look_alikes.keys())
         self.ocr_worker = OCRWorker(self.reader, allowed_chars)
         self.ocr_worker.result_ready.connect(self.handle_auto_results)
@@ -130,10 +123,24 @@ class OCRApp(QMainWindow):
         self.btn_load_vid.clicked.connect(self.load_video)
         right_layout.addWidget(self.btn_load_vid)
         
+        # --- NEW: Camera Selection Layout ---
+        cam_layout = QHBoxLayout()
+        self.cam_combo = QComboBox()
+        self.cam_combo.addItems([
+            "Cam 0 (Default)", 
+            "Cam 1 (USB)", 
+            "Cam 2 (USB)", 
+            "Cam 3 (USB)"
+        ])
+        cam_layout.addWidget(self.cam_combo)
+
         self.btn_start_cam = QPushButton("3. Live Camera")
         self.btn_start_cam.clicked.connect(self.start_camera)
-        right_layout.addWidget(self.btn_start_cam)
+        cam_layout.addWidget(self.btn_start_cam)
         
+        right_layout.addLayout(cam_layout)
+        # ------------------------------------
+
         self.btn_select_roi = QPushButton("4. Select ROI")
         self.btn_select_roi.clicked.connect(self.select_roi)
         right_layout.addWidget(self.btn_select_roi)
@@ -153,7 +160,7 @@ class OCRApp(QMainWindow):
         self.conf_slider.valueChanged.connect(self.update_ui_state)
         right_layout.addWidget(self.conf_slider)
 
-        # --- NEW: Action Buttons ---
+        # --- Action Buttons ---
         action_layout = QHBoxLayout()
         
         self.btn_run_ocr = QPushButton("RUN OCR\n(Single)")
@@ -216,7 +223,17 @@ class OCRApp(QMainWindow):
 
     def start_camera(self):
         self.stop_media()
-        self.capture = cv2.VideoCapture(0)
+        
+        # --- NEW: Get index from dropdown ---
+        cam_idx = self.cam_combo.currentIndex()
+        self.capture = cv2.VideoCapture(cam_idx)
+        
+        # Check if the camera actually opened
+        if not self.capture.isOpened():
+            QMessageBox.warning(self, "Camera Error", f"Could not connect to Camera {cam_idx}. Make sure it is plugged in and not being used by another app.")
+            self.capture = None
+            return
+            
         self.roi = None
         self.timer.start(30)
 
@@ -235,7 +252,6 @@ class OCRApp(QMainWindow):
                 self.current_frame = frame
                 self.display_frame(frame)
                 
-                # If Auto-Capture is active, feed the latest frame to the worker thread
                 if self.ocr_worker.is_running:
                     if self.roi:
                         x, y, w, h = self.roi
@@ -342,14 +358,13 @@ class OCRApp(QMainWindow):
     def stop_auto_ocr(self):
         if self.ocr_worker.is_running:
             self.ocr_worker.stop()
-            self.ocr_worker.wait() # Safely wait for thread to close
+            self.ocr_worker.wait() 
             self.btn_auto_update.setEnabled(True)
             self.btn_run_ocr.setEnabled(True)
             self.btn_stop_auto.setEnabled(False)
             self.result_text.append("--- Auto-Capture Stopped ---")
 
     def handle_auto_results(self, results):
-        """Receives data from the background thread without freezing the UI"""
         min_conf = self.conf_slider.value() / 100.0 
         found_any = False
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -362,7 +377,6 @@ class OCRApp(QMainWindow):
                     output_lines.append(f"[{timestamp}] Auto-Scan: {final_text} (Conf: {prob:.2f})")
                     found_any = True
                     
-        # Only print if we actually found something to avoid text spam
         if found_any:
             for line in output_lines:
                 self.result_text.append(line)
@@ -415,4 +429,3 @@ if __name__ == '__main__':
     window = OCRApp()
     window.show()
     sys.exit(app.exec_())
-    
